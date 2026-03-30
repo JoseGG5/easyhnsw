@@ -128,8 +128,8 @@ def create_nsw(X: np.ndarray, top_k: int, distance_metric: Callable = cosine_dis
 
 
 def assign_layer(top_k):
-    """ Probability distribution to assign each node
-    to a layer. The idea is that low layers will contain most or
+    """ Assign each node to a layer following a given distribution.
+    The idea is that low layers will contain most or
     all nodes and upper layers will have a small number of nodes.
     This introduces the HIERARCHICAL concept."""
 
