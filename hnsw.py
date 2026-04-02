@@ -8,13 +8,27 @@ import networkx as nx
 from sklearn.metrics.pairwise import cosine_distances
 from matplotlib import pyplot as plt
 
-""" Simplified version of a HNSW-like data structure. The core idea is the same, but note
-    that we are performing random entrypoint selection, and we don't have a tracking
-    of the degree of each node. However, this version is more than enough to grasp
-    what a HNSW is how it is created. """
+""" Simplified version of a HNSW-like data structure.
 
-N = 100
-D = 128
+    The core idea is preserved, but note that:
+    
+    1. We use random entrypoint selection instead of maintaining a global entry point,
+       which differs from the original HNSW algorithm.
+    
+    2. We do not enforce a maximum number of connections per node. The parameter `top_k`
+       only controls how many neighbors a node connects to at insertion time, but existing
+       nodes are not pruned.
+    
+    3. We do not use efConstruction. In the original HNSW algorithm, insertion involves
+       exploring a larger neighborhood and keeping track of the efConstruction best candidates.
+       Here, for simplicity, we only perform a greedy search, select the closest node found,
+       and connect to it and its neighbors. This means that as our search is worse, long connections
+       have a smaller chance to appear.
+    
+    Despite these simplifications, this implementation captures the main intuition behind
+    HNSW and is sufficient to understand how the structure is built.
+"""
+
 
 def select_entrypoint(nsw: nx.Graph) -> int:
     """Naive random selection
@@ -87,14 +101,7 @@ def greedy_search(nsw: nx.Graph, entry: int, query_rpr: np.ndarray, distance_met
     return current
 
 
-
-
-
-
-
-
-
-def assign_layer(top_k):
+def assign_layer(top_k: int):
     """ Assign each node to a layer following a given distribution.
     The idea is that low layers will contain most or
     all nodes and upper layers will have a small number of nodes.
@@ -110,128 +117,126 @@ def assign_layer(top_k):
     return int(-math.log(np.random.rand()) * mL)
 
 
-def create_hnsw(X: np.ndarray, top_k: int, distance_metric: Callable = cosine_distances) -> dict:    
-    
-    """ to match the hierarchical structure, hnsw will be a python dict 
-    where each key will be fomratted as layer N and inside each layer there will
-    a NSW graph"""
-    
-    # in the beginning, set max layer to -1
-    L_max = -1
-    
+def create_hnsw(X: np.ndarray, top_k: int, distance_metric: Callable = cosine_distances) -> dict:
+    """
+    Function used to build the hnsw data structure.
+
+    Parameters
+    ----------
+    X : np.ndarray
+        The dataset from which we will build our data structure.
+    top_k : int
+        The parameter that controls to how many nodes each node gets connected at insert time.
+    distance_metric : Callable, optional
+        Function used to compute the distance metric. The default is cosine_distances.
+
+    Returns
+    -------
+    dict
+        A dict where each key is a layer and the value associated is the NSW data structure.
+
+    """
     hnsw = defaultdict(nx.Graph)
+    L_max = -1  # in the beginning we don't have any layers
 
     for node_idx, x in enumerate(X):
-                
+        
         # get the layer assigned to the node
         layer = assign_layer(top_k=top_k)
-        
+
         # if it's the first node we will append it from all layer between layer and 0
         if node_idx == 0:
             for layer_idx in range(layer, -1, -1):
                 key = f"layer {layer_idx}"
                 hnsw[key].add_node(node_idx, representation=x)
-            
-            # update max layer and jump to new data point
             L_max = layer
             continue
-                
-        
-        # else, we perform the standard hnsw insert algorithm
+
+        # we begin with the typical hnsw algorithm
+        # we start from max layer and descent to layer - 1 looking for the
+        # best entrypoints
         key = f"layer {L_max}"
-        
-        # get a random entrypoint from the max layer
-        ep = select_entrypoint(nsw=hnsw[key])
+        ep = select_entrypoint(hnsw[key])
 
-        # from max layer to the one before the assigned searching for good entrypoints
-        # note that if new layer is higher than L_max, this will not run (as expected)
+        # greedy descent from L_max to layer -1
+        # note that if L_max < layer, this is not executed (as expected) as we
+        # don't need greedy descent and would only need to insert from layer to 0
         for layer_idx in range(L_max, layer, -1):
-            
             key = f"layer {layer_idx}"
-            
-            found = greedy_search(
-                nsw=hnsw[key],
-                entry=ep,
-                query_rpr=x,
-                distance_metric=distance_metric
-                )
-            
-            # create the set of possible nodes 
-            # (just the node found with greedy and its neighbors)
-            set_possible = [found]
-            set_possible.extend(list(hnsw[key].neighbors(found)))
-            
-            # get the closest one from the possible list of candidates
-            repr_candidates = [hnsw[layer_idx].nodes[node]["representation"] for node in set_possible]
-            distances = distance_metric(x.reshape(1, -1), np.array(repr_candidates))[0]
-            best_idx = np.argmin(distances)
-            
-            # update ep
-            ep = set_possible[best_idx]
-                
-        
-        # insert from the corresponding layer
-        layer_to_insert_from = min(layer, L_max)
-        for layer_idx in range(layer_to_insert_from, -1, -1):
-            
-            key = f"layer {layer_idx}"
-            # same process than in a nsw graph
-            # perform greedy search
-            found = greedy_search(
-                nsw=hnsw[key],
-                entry=ep,
-                query_rpr=x,
-                distance_metric=distance_metric
-                )
 
-            # create the set of possible nodes (just the node found with greedy and its neighbors)
-            set_possible = [found]
-            set_possible.extend(list(hnsw[key].neighbors(found)))
-            
-            # get top-k with distance
-            repr_topk = [hnsw[key].nodes[node]["representation"] for node in set_possible]
-            distances = distance_metric(x.reshape(1, -1), np.array(repr_topk))[0]
-            if len(distances) >= top_k: 
+            found = greedy_search(
+                nsw=hnsw[key],
+                entry=ep,
+                query_rpr=x,
+                distance_metric=distance_metric
+            )
+
+            # refine entrypoint by looking at the closest one from the possible set
+            set_possible = [found] + list(hnsw[key].neighbors(found))
+            repr_candidates = [hnsw[key].nodes[n]["representation"] for n in set_possible]
+            distances = distance_metric(x.reshape(1, -1), np.array(repr_candidates))[0]
+
+            ep = set_possible[np.argmin(distances)]
+
+        # now we proceed to insert from layer - 1 to 0 with the best ep found
+        for layer_idx in range(min(layer, L_max), -1, -1):
+            key = f"layer {layer_idx}"
+
+            found = greedy_search(
+                nsw=hnsw[key],
+                entry=ep,
+                query_rpr=x,
+                distance_metric=distance_metric
+            )
+
+            set_possible = [found] + list(hnsw[key].neighbors(found))
+
+            repr_candidates = [hnsw[key].nodes[n]["representation"] for n in set_possible]
+            distances = distance_metric(x.reshape(1, -1), np.array(repr_candidates))[0]
+
+            if len(distances) > top_k:
                 topk_idxs = np.argpartition(distances, top_k - 1)[:top_k]
-                nodes_connect = np.array(set_possible)[topk_idxs]
+                nodes_connect = list(np.array(set_possible)[topk_idxs])
             else:
                 nodes_connect = set_possible
 
-            # create the node and add edges
+            # add node and connect to the top k closest
             hnsw[key].add_node(node_idx, representation=x)
-            for idx in nodes_connect:
-                hnsw[key].add_edge(node_idx, idx)
-            
-            # next entry point for lower layer
-            best_idx = np.argmin(distances)
-            ep = set_possible[best_idx]
-            
-          
-        """ update layer if needed and also, if layer is bigger than L_max
-        we would have missed appending nodes from layer to last L_max, so we do that"""
+            for n in nodes_connect:
+                hnsw[key].add_edge(node_idx, n)
+
+            # update entrypoint
+            ep = set_possible[np.argmin(distances)]
+
+        # now, if layer is bigger than L_max, then we would have only inserte
+        # from L_max to 0, but from layer to L_max we have not inserted so we
+        # proceed to do that and update L_max
         if layer > L_max:
             for layer_idx in range(L_max + 1, layer + 1):
-                hnsw[layer_idx].add_node(node_idx, representation=x)
+                key = f"layer {layer_idx}"
+                hnsw[key].add_node(node_idx, representation=x)
             L_max = layer
-        
+
     return hnsw
-
-    
-
-
-
-
 
 
 
 if __name__ == "__main__":
     # simulate a batch of N representations with D dims each
+    N = 1000
+    D = 128
     X = np.random.randn(N, D)
     
     # create a Hierarchical Navigable Small World data structure
     hnsw = create_hnsw(X, 8)
     
-    
-
+    for layer, graph in hnsw.items():
+        # plot it
+        fig, ax = plt.subplots()
+        nx.draw(graph, ax=ax, with_labels=True)
+        ax.set_title(layer)
+        plt.show()
+            
+    assert hnsw["layer 0"].number_of_nodes() == N, "LAYER 0 IS UNCOMPLETED"
     
     
